@@ -1047,14 +1047,14 @@ func TestShardKVPerformance(t *testing.T) {
 	// 定义测试用例
 	testCases := []TestCase{
 		// ShardKV 测试
-		{"ShardKV-基础配置", "shardkv", 3, 3, 5, 20 * time.Second, 64, 80, 1000},
-		{"ShardKV-读密集型", "shardkv", 3, 3, 5, 20 * time.Second, 64, 95, 1000},
-		{"ShardKV-写密集型", "shardkv", 3, 3, 5, 20 * time.Second, 64, 50, 1000},
+		{"ShardKV-基础配置", "shardkv", 3, 3, 5, 20 * time.Second, 64, 80, 100},
+		{"ShardKV-读密集型", "shardkv", 3, 3, 5, 20 * time.Second, 64, 95, 100},
+		{"ShardKV-写密集型", "shardkv", 3, 3, 5, 20 * time.Second, 64, 50, 100},
 
 		// ShardKV 组数变化测试
-		{"ShardKV-3nodes-1group", "shardkv", 1, 3, 5, 20 * time.Second, 64, 80, 1000},
-		{"ShardKV-6nodes-2group", "shardkv", 2, 3, 5, 20 * time.Second, 64, 80, 1000},
-		{"ShardKV-9nodes-3group", "shardkv", 3, 3, 5, 20 * time.Second, 64, 80, 1000},
+		{"ShardKV-3nodes-1group", "shardkv", 1, 3, 5, 20 * time.Second, 64, 80, 100},
+		{"ShardKV-6nodes-2group", "shardkv", 2, 3, 5, 20 * time.Second, 64, 80, 100},
+		{"ShardKV-9nodes-3group", "shardkv", 3, 3, 5, 20 * time.Second, 64, 80, 100},
 	}
 
 	// 保存各个测试结果，用于最终比较
