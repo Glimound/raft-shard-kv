@@ -73,49 +73,86 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
+
+	readIndex, term, isLeader, confirmChan := kv.rf.StartReadIndex()
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	DPrintf(dServer, "S%d G%d [Get R%d K%s] Start ReadIndex: idx=%d, term=%d", kv.me, kv.gid, args.RequestId, args.Key, readIndex, term)
+
+	// 等待 Leader 身份确认结果
+	confirmTimer := time.NewTimer(500 * time.Millisecond)
+	defer confirmTimer.Stop()
+
+	select {
+	case confirmed := <-confirmChan:
+		if !confirmed {
+			DPrintf(dServer, "S%d G%d [Get R%d K%s] ReadIndex confirmation failed or leadership lost", kv.me, kv.gid, args.RequestId, args.Key)
+			reply.Err = ErrWrongLeader // Leadership lost or confirmation failed
+			return
+		}
+		DPrintf(dServer, "S%d G%d [Get R%d K%s] ReadIndex confirmed for idx=%d", kv.me, kv.gid, args.RequestId, args.Key, readIndex)
+		// Leadership confirmed
+	case <-confirmTimer.C:
+		DPrintf(dServer, "S%d G%d [Get R%d K%s] Timeout waiting for ReadIndex confirmation", kv.me, kv.gid, args.RequestId, args.Key)
+		reply.Err = ErrWrongLeader // Timeout waiting for confirmation
+		return
+	}
+
+	// 等待状态机应用到 readIndex
+	applyTimer := time.NewTimer(500 * time.Millisecond) // 再设置一个等待 apply 的超时
+	defer applyTimer.Stop()
+	for {
+		kv.mu.Lock()
+		appliedIndex := kv.lastAppliedIndex
+		currentTerm, stillLeader := kv.rf.GetState() // 再次检查 leader 状态和 term
+		kv.mu.Unlock()                               // 轮询时尽快释放锁
+
+		if !stillLeader || currentTerm != term {
+			DPrintf(dServer, "S%d G%d [Get R%d K%s] Leadership lost or term changed while waiting for apply (current: T%d, leader:%v; expected: T%d)", kv.me, kv.gid, args.RequestId, args.Key, currentTerm, stillLeader, term)
+			reply.Err = ErrWrongLeader
+			return
+		}
+
+		if appliedIndex >= readIndex {
+			DPrintf(dServer, "S%d G%d [Get R%d K%s] State machine caught up (applied=%d >= readIndex=%d)", kv.me, kv.gid, args.RequestId, args.Key, appliedIndex, readIndex)
+			break // 状态机已追上
+		}
+
+		select {
+		case <-applyTimer.C:
+			DPrintf(dServer, "S%d G%d [Get R%d K%s] Timeout waiting for state machine apply (applied=%d < readIndex=%d)", kv.me, kv.gid, args.RequestId, args.Key, appliedIndex, readIndex)
+			reply.Err = ErrWrongLeader // 或者 ErrTimeout? 假设 Leader/Apply 卡顿等同于 Leader 问题
+			return
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// 执行本地读取 (在锁内进行，确保读取一致性)
 	kv.mu.Lock()
 	shard := key2shard(args.Key)
-	if kv.config.Shards[shard] != kv.gid || kv.gid == 0 || kv.shardStates[shard] != Serving {
+	if kv.config.Shards[shard] != kv.gid || kv.shardStates[shard] != Serving {
+		DPrintf(dServer, "S%d G%d [Get R%d K%s] Wrong group/state after wait (gid: %d vs %d, state: %d)", kv.me, kv.gid, args.RequestId, args.Key, kv.config.Shards[shard], kv.gid, kv.shardStates[shard])
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
 		return
 	}
 
-	op := Op{
-		Operation: OpGet,
-		Key:       args.Key,
-		ClientId:  args.ClientId,
-		RequestId: args.RequestId,
-		CommandId: args.CommandId,
+	// 执行读取
+	if value, ok := kv.store[args.Key]; ok {
+		reply.Value = value
+		reply.Err = OK
+		DPrintf(dServer, "S%d G%d [Get R%d K%s] ReadIndex read successful, value: %s", kv.me, kv.gid, args.RequestId, args.Key, value)
+	} else {
+		reply.Err = ErrNoKey
+		DPrintf(dServer, "S%d G%d [Get R%d K%s] ReadIndex read successful, key not found", kv.me, kv.gid, args.RequestId, args.Key)
 	}
-
-	_, term, isLeader := kv.rf.Start(op)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		kv.mu.Unlock()
-		return
-	}
-
-	DPrintf(dServer, "S%d G%d receive valid Get RPC from C%d, R%d", kv.me, kv.gid, args.ClientId, args.RequestId)
-
-	notifyChan := make(chan Notification, 1)
-	kv.notifyChanMap[op.CommandId] = notifyChan
 	kv.mu.Unlock()
 
-	// when leader changed (term changed), it should redirect immediately
-	go kv.termDetector(term, op.CommandId)
-
-	select {
-	case notification := <-notifyChan:
-		reply.Err = notification.err
-		reply.Value = notification.value
-	case <-time.After(1000 * time.Millisecond):
-		reply.Err = ErrWrongLeader // 超时，可能是leader变更了
-	}
-
-	kv.mu.Lock()
-	delete(kv.notifyChanMap, op.CommandId)
-	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -184,6 +221,7 @@ func (kv *ShardKV) killed() bool {
 func (kv *ShardKV) applier() {
 	for !kv.killed() {
 		msg := <-kv.applyCh
+		kv.lastAppliedIndex = msg.CommandIndex
 		if !msg.CommandValid {
 			if msg.SnapshotValid {
 				kv.installSnapshot(msg)

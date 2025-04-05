@@ -69,6 +69,16 @@ type Raft struct {
 	debugType string
 }
 
+type ReadIndexStatus struct {
+	mu        sync.Mutex
+	readIndex int
+	term      int
+	// 等待确认的 channel，true 表示确认成功，false 表示失败（例如 leadership 丢失）
+	confirmChan chan bool
+	// 请求此 ReadIndex 的计数，用于共享确认结果
+	requestCount int
+}
+
 type LogEntry struct {
 	Command interface{}
 	Term    int
@@ -82,6 +92,169 @@ func (rf *Raft) GetState() (int, bool) {
 	isleader = rf.currentRole == leader
 	rf.mu.Unlock()
 	return term, isleader
+}
+
+func (rf *Raft) GetCommitIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex
+}
+
+func (rf *Raft) StartReadIndex() (readIndex int, term int, isLeader bool, confirmChan chan bool) {
+	rf.mu.Lock()
+	if rf.currentRole != leader {
+		rf.mu.Unlock()
+		return -1, -1, false, nil
+	}
+
+	readIndex = rf.commitIndex // 记录当前的 commitIndex
+	term = rf.CurrentTerm
+	isLeader = true
+	confirmChan = make(chan bool, 1)
+
+	// 启动后台 goroutine 执行领导权确认
+	go rf.confirmLeadershipForRead(term, readIndex, confirmChan)
+
+	rf.mu.Unlock()
+	return readIndex, term, isLeader, confirmChan
+}
+
+// 这个函数负责向大多数 follower 发送心跳并等待响应，以确认 Leader 地位。
+func (rf *Raft) confirmLeadershipForRead(originalTerm int, readIndex int, confirmChan chan bool) {
+	rf.mu.Lock()
+	// 再次快速检查：确认期间是否仍然是 Leader 并且任期未变？
+	if rf.currentRole != leader || rf.CurrentTerm != originalTerm {
+		rf.mu.Unlock()
+		DPrintf(rf.debugType, dRead, "S%d [ReadConfirm T%d I%d] Failed: No longer leader or term changed (%d, %d)", rf.me, originalTerm, readIndex, rf.currentRole, rf.CurrentTerm)
+		confirmChan <- false
+		close(confirmChan)
+		return
+	}
+	rf.mu.Unlock() // 释放锁，准备发送 RPC
+
+	confirmCount := 1 // Leader 自己算一票
+	var wg sync.WaitGroup
+	majority := len(rf.peers)/2 + 1
+	confirmResultChan := make(chan bool, len(rf.peers)-1) // 用于收集确认结果
+
+	DPrintf(rf.debugType, dRead, "S%d [ReadConfirm T%d I%d] Starting confirmation, need %d", rf.me, originalTerm, readIndex, majority)
+
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			rf.mu.Lock()
+			// 再次检查 Leader 状态和任期，避免在过时状态下发送 RPC
+			if rf.currentRole != leader || rf.CurrentTerm != originalTerm {
+				rf.mu.Unlock()
+				return
+			}
+
+			prevLogIndex := rf.nextIndex[p] - 1
+			if prevLogIndex < rf.lastIncludedIndex {
+				// 需要发送快照，无法通过心跳确认。暂时忽略此 peer 的确认。
+				// 一个更健壮的实现可能需要等待快照发送成功。
+				DPrintf(rf.debugType, dRead, "S%d [ReadConfirm T%d I%d] Skipped S%d (needs snapshot, nextIdx=%d, snapIdx=%d)", rf.me, originalTerm, readIndex, p, rf.nextIndex[p], rf.lastIncludedIndex)
+				rf.mu.Unlock()
+				return
+			}
+
+			prevLogTerm := 0
+			actualPrevIndex := rf.getActualIndex(prevLogIndex)
+			if actualPrevIndex > 0 {
+				prevLogTerm = rf.Log[actualPrevIndex].Term
+			} else if actualPrevIndex == 0 && rf.snapshot != nil {
+				prevLogTerm = rf.lastIncludedTerm
+			}
+
+			// 构建心跳参数 (Entries 为空)
+			args := AppendEntriesArgs{
+				Term:         originalTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex, // 使用 nextIndex - 1
+				PrevLogTerm:  prevLogTerm,
+				Entries:      nil, // 空的心跳
+				LeaderCommit: rf.commitIndex,
+			}
+			rf.mu.Unlock() // RPC 前解锁
+
+			reply := AppendEntriesReply{}
+			// 设置一个合理的 RPC 超时，例如心跳间隔的一半
+			rpcTimer := time.NewTimer(50 * time.Millisecond) // 50ms 超时示例
+			defer rpcTimer.Stop()
+			callCh := make(chan bool, 1)
+
+			go func() {
+				ok := rf.peers[p].Call("Raft.AppendEntries", &args, &reply)
+				callCh <- ok
+			}()
+
+			var ok bool
+			select {
+			case ok = <-callCh:
+				// RPC 完成
+			case <-rpcTimer.C:
+				// RPC 超时
+				DPrintf(rf.debugType, dRead, "S%d [ReadConfirm T%d I%d] Timeout sending heartbeat to S%d", rf.me, originalTerm, readIndex, p)
+				ok = false
+			}
+
+			if ok {
+				rf.mu.Lock()
+				// 检查响应的 Term
+				if reply.Term > rf.CurrentTerm {
+					// 发现更高任期，转为 Follower
+					DPrintf(rf.debugType, dTerm, "S%d [ReadConfirm T%d I%d] Found higher term %d from S%d, stepping down", rf.me, originalTerm, readIndex, reply.Term, p)
+					rf.CurrentTerm = reply.Term
+					rf.currentRole = follower
+					rf.Voted = false
+					rf.persist()
+				} else if reply.Term == originalTerm && rf.currentRole == leader {
+					DPrintf(rf.debugType, dRead, "S%d [ReadConfirm T%d I%d] Received confirmation from S%d", rf.me, originalTerm, readIndex, p)
+					confirmResultChan <- true
+				} else {
+					DPrintf(rf.debugType, dRead, "S%d [ReadConfirm T%d I%d] Failed confirmation from S%d (ok=%v, replyTerm=%d, currentTerm=%d, role=%d, success=%v)", rf.me, originalTerm, readIndex, p, ok, reply.Term, rf.CurrentTerm, rf.currentRole, reply.Success)
+				}
+				rf.mu.Unlock()
+			} else {
+				DPrintf(rf.debugType, dRead, "S%d [ReadConfirm T%d I%d] Failed sending heartbeat to S%d (ok=false)", rf.me, originalTerm, readIndex, p)
+			}
+		}(peer)
+	}
+
+	// 启动一个 goroutine 等待所有 RPC 完成或超时
+	go func() {
+		wg.Wait()
+		close(confirmResultChan) // 所有 goroutine 完成后关闭 channel
+	}()
+
+	// 收集确认结果
+	confirmedPeers := 0
+	for confirmed := range confirmResultChan {
+		if confirmed {
+			confirmedPeers++
+			if confirmCount+confirmedPeers >= majority {
+				DPrintf(rf.debugType, dRead, "S%d [ReadConfirm T%d I%d] Majority confirmed (%d >= %d)", rf.me, originalTerm, readIndex, confirmCount+confirmedPeers, majority)
+				break // 已达到多数，无需继续等待
+			}
+		}
+	}
+
+	// 最终判断是否成功确认
+	rf.mu.Lock() // 需要锁来检查最终状态
+	// 必须在原始任期内，并且仍然是 Leader，并且收到了多数确认
+	if rf.CurrentTerm == originalTerm && rf.currentRole == leader && confirmCount+confirmedPeers >= majority {
+		DPrintf(rf.debugType, dRead, "S%d [ReadConfirm T%d I%d] Confirmation successful", rf.me, originalTerm, readIndex)
+		confirmChan <- true
+	} else {
+		DPrintf(rf.debugType, dRead, "S%d [ReadConfirm T%d I%d] Confirmation failed (currentTerm=%d, role=%d, confirmedCount=%d, majority=%d)", rf.me, originalTerm, readIndex, rf.CurrentTerm, rf.currentRole, confirmCount+confirmedPeers, majority)
+		confirmChan <- false
+	}
+	rf.mu.Unlock()
+	close(confirmChan) // 关闭确认 channel
 }
 
 func (rf *Raft) persist() {
