@@ -734,14 +734,14 @@ func TestKVRaftPerformance(t *testing.T) {
 	// 定义测试用例
 	testCases := []TestCase{
 		// 基本测试
-		{"basic", 3, 5, 20 * time.Second, 64, 80, 1000, false},
-		{"read-intensively", 3, 5, 20 * time.Second, 64, 95, 1000, false},
-		{"write-intensively", 3, 5, 20 * time.Second, 64, 50, 1000, false},
+		{"basic", 3, 5, 20 * time.Second, 64, 80, 100, false},
+		{"read-intensively", 3, 5, 20 * time.Second, 64, 95, 100, false},
+		{"write-intensively", 3, 5, 20 * time.Second, 64, 50, 100, false},
 
 		// 节点数变化测试
-		{"3-nodes", 3, 5, 20 * time.Second, 64, 80, 1000, false},
-		{"6-nodes", 6, 5, 20 * time.Second, 64, 80, 1000, false},
-		{"9-nodes", 9, 5, 20 * time.Second, 64, 80, 1000, false},
+		{"3-nodes", 3, 5, 20 * time.Second, 64, 80, 100, false},
+		{"6-nodes", 6, 5, 20 * time.Second, 64, 80, 100, false},
+		{"9-nodes", 9, 5, 20 * time.Second, 64, 80, 100, false},
 	}
 
 	// 保存各个测试结果，用于最终比较
