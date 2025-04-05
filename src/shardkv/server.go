@@ -66,6 +66,8 @@ type ShardKV struct {
 	// use for duplicate detection
 	clientId  int64
 	requestId int64
+
+	applyCond *sync.Cond
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -73,6 +75,77 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	isLeaseValid, currentTerm := kv.rf.GetLeaseState()
+	if isLeaseValid {
+		// 2. 记录 ReadIndex (当前 commitIndex)
+		readIndex := kv.rf.CommitIndex()
+
+		kv.mu.Lock()
+		// 3. 再次检查 Term 和 Leader 身份 (防止在检查租约和加锁之间发生变化)
+		termCheck, isLeaderCheck := kv.rf.GetState()
+		if !isLeaderCheck || termCheck != currentTerm {
+			// 身份或任期变化，租约失效
+			kv.mu.Unlock()
+			// 回退到 LogRead/Write Path (见下文)
+			goto FallbackPath // 使用 goto 跳转到 Fallback 逻辑
+		}
+
+		// 4. 检查 Shard 归属和状态
+		shard := key2shard(args.Key)
+		if kv.config.Shards[shard] != kv.gid || kv.gid == 0 || kv.shardStates[shard] != Serving {
+			reply.Err = ErrWrongGroup
+			kv.mu.Unlock()
+			return
+		}
+
+		// 5. 等待状态机应用到 ReadIndex
+		startTime := time.Now()
+		for kv.lastAppliedIndex < readIndex {
+			// 设置一个等待超时，防止无限等待 (可选但推荐)
+			if time.Since(startTime) > 500*time.Millisecond { // 例如 500ms 超时
+				DPrintf(dError, "S%d G%d LeaseRead wait apply timeout I%d > L%d", kv.me, kv.gid, readIndex, kv.lastAppliedIndex)
+				kv.mu.Unlock()
+				// 超时，可能 Leader 状态变化或 Raft 卡住，回退
+				goto FallbackPath
+			}
+			// 再次检查 leader 状态，防止等待期间失去领导权
+			termCheckLoop, isLeaderCheckLoop := kv.rf.GetState()
+			if !isLeaderCheckLoop || termCheckLoop != currentTerm {
+				kv.mu.Unlock()
+				reply.Err = ErrWrongLeader // 在等待期间失去 Leader
+				return
+			}
+
+			kv.applyCond.Wait() // 等待 applier 发信号
+		}
+		// 等待结束，lastAppliedIndex >= readIndex
+
+		// 6. 再次检查 Shard 状态 (可能在等待期间发生配置变更)
+		if kv.config.Shards[shard] != kv.gid || kv.gid == 0 || kv.shardStates[shard] != Serving {
+			reply.Err = ErrWrongGroup
+			kv.mu.Unlock()
+			return
+		}
+
+		// 7. 从本地状态机读取数据
+		value, ok := kv.store[args.Key]
+		if ok {
+			reply.Err = OK
+			reply.Value = value
+			DPrintf(dServer, "S%d G%d serve Get (LeaseRead OK) R%d K:%s at L:%d (readIndex %d)", kv.me, kv.gid, args.RequestId, args.Key, kv.lastAppliedIndex, readIndex)
+		} else {
+			reply.Err = ErrNoKey
+			DPrintf(dServer, "S%d G%d serve Get (LeaseRead NoKey) R%d K:%s at L:%d (readIndex %d)", kv.me, kv.gid, args.RequestId, args.Key, kv.lastAppliedIndex, readIndex)
+		}
+		kv.mu.Unlock()
+		return // *** LeaseRead 成功，直接返回 ***
+	}
+
+	// --- Fallback Path (Lease 无效或上面 goto 跳转过来) ---
+FallbackPath:
+	DPrintf(dServer, "S%d G%d Get R%d K:%s fallback to Raft log (lease invalid or check failed)", kv.me, kv.gid, args.RequestId, args.Key)
+
+	// 使用原有的通过 Raft 日志处理 Get 请求的逻辑
 	kv.mu.Lock()
 	shard := key2shard(args.Key)
 	if kv.config.Shards[shard] != kv.gid || kv.gid == 0 || kv.shardStates[shard] != Serving {
@@ -82,37 +155,39 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	op := Op{
-		Operation: OpGet,
+		Operation: OpGet, // 标记为 Get 操作
 		Key:       args.Key,
 		ClientId:  args.ClientId,
 		RequestId: args.RequestId,
-		CommandId: args.CommandId,
+		CommandId: args.CommandId, // 使用传入的 CommandId
 	}
 
-	_, term, isLeader := kv.rf.Start(op)
+	// 提交到 Raft
+	startTerm, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
+		// 如果 Start() 返回不是 Leader，那之前的 Lease 检查可能刚好在边缘
 		reply.Err = ErrWrongLeader
 		kv.mu.Unlock()
 		return
 	}
 
-	DPrintf(dServer, "S%d G%d receive valid Get RPC from C%d, R%d", kv.me, kv.gid, args.ClientId, args.RequestId)
+	DPrintf(dServer, "S%d G%d submitted Get R%d K:%s to Raft log (term %d)", kv.me, kv.gid, args.RequestId, args.Key, startTerm)
 
+	// 使用 notifyChan 等待结果 (与原 PutAppend 类似)
 	notifyChan := make(chan Notification, 1)
 	kv.notifyChanMap[op.CommandId] = notifyChan
-	kv.mu.Unlock()
-
-	// when leader changed (term changed), it should redirect immediately
-	go kv.termDetector(term, op.CommandId)
+	kv.mu.Unlock() // 解锁，等待 Raft 应用
 
 	select {
 	case notification := <-notifyChan:
 		reply.Err = notification.err
 		reply.Value = notification.value
-	case <-time.After(1000 * time.Millisecond):
-		reply.Err = ErrWrongLeader // 超时，可能是leader变更了
+	case <-time.After(1000 * time.Millisecond): // 保留超时
+		reply.Err = ErrWrongLeader
+		DPrintf(dError, "S%d G%d Get R%d K:%s timed out waiting for Raft apply", kv.me, kv.gid, args.RequestId, args.Key)
 	}
 
+	// 清理 notifyChan
 	kv.mu.Lock()
 	delete(kv.notifyChanMap, op.CommandId)
 	kv.mu.Unlock()
@@ -207,6 +282,7 @@ func (kv *ShardKV) applier() {
 			kv.config = cloneConfig(op.Config)
 			kv.updateShardsState()
 			kv.lastAppliedIndex = msg.CommandIndex
+			kv.applyCond.Broadcast()
 			kv.snapshotTrigger()
 			DPrintf(dServer, "S%d G%d applied config change from %d to %d, new shardStates: %v",
 				kv.me, kv.gid, kv.lastConfig.Num, kv.config.Num, kv.shardStates)
@@ -255,6 +331,7 @@ func (kv *ShardKV) applier() {
 			}
 			kv.dupMap[op.ClientId] = op.RequestId
 			kv.lastAppliedIndex = msg.CommandIndex
+			kv.applyCond.Broadcast()
 			kv.snapshotTrigger()
 			DPrintf(dServer, "S%d G%d applied OpMerge for shards %v in config %d, new shardStates: %v",
 				kv.me, kv.gid, op.ShardsChanged, op.ConfigNum, kv.shardStates)
@@ -293,6 +370,7 @@ func (kv *ShardKV) applier() {
 			}
 			kv.dupMap[op.ClientId] = op.RequestId
 			kv.lastAppliedIndex = msg.CommandIndex
+			kv.applyCond.Broadcast()
 			kv.snapshotTrigger()
 			DPrintf(dServer, "S%d G%d applied OpClean for shards %v in config %d, new shardStates: %v",
 				kv.me, kv.gid, op.ShardsChanged, op.ConfigNum, kv.shardStates)
@@ -334,6 +412,7 @@ func (kv *ShardKV) applier() {
 				}
 				kv.dupMap[op.ClientId] = op.RequestId
 				kv.lastAppliedIndex = msg.CommandIndex
+				kv.applyCond.Broadcast()
 				kv.snapshotTrigger()
 			} else if op.Operation == OpGet {
 				DPrintf(dServer, "S%d G%d find duplicate log I%d, R%d <= %d, operation: %d", kv.me, kv.gid, msg.CommandIndex,
@@ -824,6 +903,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.rf.SetDebugType("shardkv")
+	kv.applyCond = sync.NewCond(&kv.mu)
 
 	go kv.applier()
 	go kv.configDetector()

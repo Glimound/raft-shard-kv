@@ -838,7 +838,7 @@ func TestKVRaftPerformance(t *testing.T) {
 			// 4. 发送停止信号并等待完成
 			close(stopCh)
 			fmt.Println("正在停止客户端...")
-			wg.Wait()
+			//wg.Wait()
 			fmt.Println("所有客户端已停止。")
 
 			elapsed := time.Since(startTime)

@@ -19,6 +19,7 @@ const (
 	dPersist   logTopic = "PERS"
 	dSnapshot  logTopic = "SNAP"
 	dBootstrap logTopic = "BOOT"
+	dLease     logTopic = "LEAS"
 	dTest      logTopic = "TEST"
 	dError     logTopic = "ERRO"
 )

@@ -21,7 +21,7 @@ const (
 	colorReset = "\033[0m"
 )
 
-const Debug = false
+const Debug = true
 
 var debugStart time.Time
 var dMu sync.Mutex

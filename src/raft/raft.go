@@ -67,6 +67,10 @@ type Raft struct {
 
 	// logger
 	debugType string
+
+	leaseMu         sync.Mutex // Mutex for lease fields
+	leaseExpiryTime time.Time  // 当前租约的过期时间 (leader's local clock)
+	leaseDuration   time.Duration
 }
 
 type LogEntry struct {
@@ -868,6 +872,10 @@ func (rf *Raft) checkMajority(nodeNum int, c <-chan int, copyTerm int) {
 				}
 				rf.matchIndex = make([]int, len(rf.peers))
 				rf.logSending = false
+				rf.leaseMu.Lock()
+				rf.leaseExpiryTime = time.Now().Add(rf.leaseDuration)
+				DPrintf(rf.debugType, dLease, "S%d granted initial lease until %v", rf.me, rf.leaseExpiryTime)
+				rf.leaseMu.Unlock()
 				// 向所有其他节点定期发送空的AppendEntries RPC（心跳）
 				// leader身份快速转变时（leader -> ? -> leader）会存在两个相同的heartbeat goroutine吗？会，且旧的goroutine
 				// 错误F：leader能且只能因收到更大的term转换为follower，不可能在heartbeat timeout间完成候选与选举
@@ -900,6 +908,12 @@ func (rf *Raft) heartbeatTicker(server int, copyTerm int) {
 			break
 		}
 
+		rf.leaseMu.Lock()
+		if rf.leaseExpiryTime.Before(time.Now().Add(rf.leaseDuration)) { // 如果快过期了，就续期
+			rf.leaseExpiryTime = time.Now().Add(rf.leaseDuration)
+			// DPrintf(rf.debugType, dLease, "S%d renewed lease for S%d until %v (simplified)", rf.me, server, rf.leaseExpiryTime)
+		}
+		rf.leaseMu.Unlock()
 		// 若当前没有日志在发送（防止冗余的一致性同步）
 		if !rf.logSending {
 			// 发送心跳，并完成一致性检查
@@ -978,6 +992,39 @@ func (rf *Raft) heartbeatTicker(server int, copyTerm int) {
 	}
 }
 
+func (rf *Raft) CommitIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex
+}
+
+// 检查当前节点的租约是否有效（必须是 Leader 且租约未过期）
+// 返回值：是否持有有效租约，当前任期（如果持有）
+func (rf *Raft) GetLeaseState() (bool, int) {
+	rf.mu.Lock()
+	currentTerm := rf.CurrentTerm
+	isLeader := rf.currentRole == leader
+	rf.mu.Unlock() // 尽早释放 Raft 主锁
+
+	if !isLeader {
+		return false, currentTerm
+	}
+
+	rf.leaseMu.Lock()
+	// 使用 Leader 的本地时钟检查是否过期
+	isValid := time.Now().Before(rf.leaseExpiryTime)
+	expiry := rf.leaseExpiryTime // for debug log
+	rf.leaseMu.Unlock()
+
+	if isValid {
+		// DPrintf(rf.debugType, dLease, "S%d lease check: valid (expires %v)", rf.me, expiry)
+		return true, currentTerm
+	} else {
+		DPrintf(rf.debugType, dLease, "S%d lease check: expired (expiry %v)", rf.me, expiry)
+		return false, currentTerm
+	}
+}
+
 func (rf *Raft) SetDebugType(debugType string) {
 	rf.debugType = debugType
 }
@@ -1008,6 +1055,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
 
+	rf.leaseDuration = (timeoutMin / 5) * time.Millisecond
 	// initialize from state persisted before a crash
 	rf.readPersist()
 
