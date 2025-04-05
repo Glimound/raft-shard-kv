@@ -11,6 +11,7 @@ import "sync"
 import "sync/atomic"
 import "fmt"
 import "io/ioutil"
+import "sort"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -711,4 +712,256 @@ func TestSnapshotUnreliableRecoverConcurrentPartition3B(t *testing.T) {
 func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable3B(t *testing.T) {
 	// Test: unreliable net, restarts, partitions, snapshots, random keys, many clients (3B) ...
 	GenericTest(t, "3B", 15, 7, true, true, true, 1000, true)
+}
+
+// 在这里添加KVRaft性能测试函数
+// TestKVRaftPerformance 测试KVRaft的性能
+func TestKVRaftPerformance(t *testing.T) {
+	fmt.Printf("测试：KVRaft 性能测试\n")
+
+	// 测试参数定义
+	type TestCase struct {
+		name           string        // 测试名称
+		numServers     int           // 服务器数量
+		numClients     int           // 并发客户端数量
+		duration       time.Duration // 测试持续时间
+		valueSize      int           // 值大小（字节）
+		readPercentage int           // 读操作百分比 (0-100)
+		keyRange       int           // 键的范围 (0 to keyRange-1)
+		unreliable     bool          // 网络是否不可靠
+	}
+
+	// 定义测试用例
+	testCases := []TestCase{
+		// 基本测试
+		{"basic", 3, 5, 20 * time.Second, 64, 80, 1000, false},
+		{"read-intensively", 3, 5, 20 * time.Second, 64, 95, 1000, false},
+		{"write-intensively", 3, 5, 20 * time.Second, 64, 50, 1000, false},
+
+		// 节点数变化测试
+		{"3-nodes", 3, 5, 20 * time.Second, 64, 80, 1000, false},
+		{"6-nodes", 6, 5, 20 * time.Second, 64, 80, 1000, false},
+		{"9-nodes", 9, 5, 20 * time.Second, 64, 80, 1000, false},
+	}
+
+	// 保存各个测试结果，用于最终比较
+	type TestResult struct {
+		throughput   float64       // 吞吐量 (ops/sec)
+		avgLatency   time.Duration // 平均延迟
+		p50Latency   time.Duration // 50分位延迟
+		p99Latency   time.Duration // 99分位延迟
+		readLatency  time.Duration // 读操作平均延迟
+		writeLatency time.Duration // 写操作平均延迟
+	}
+
+	results := make(map[string]TestResult)
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fmt.Printf("========== 开始测试: %s ==========\n", tc.name)
+
+			// 1. 测试设置
+			cfg := make_config(t, tc.numServers, tc.unreliable, 10000) // 可靠/不可靠网络
+			defer cfg.cleanup()
+
+			// 给集群一些时间以完成配置和选举
+			fmt.Printf("等待KVRaft集群稳定（%d 个服务器）...\n", tc.numServers)
+			time.Sleep(3 * time.Second)
+
+			// 2. 并发设置
+			var opsCount int64           // 操作成功计数器
+			var getCount, putCount int64 // 分别计数读写操作
+
+			// 延迟统计
+			var totalLatency, readLatency, writeLatency int64
+			latencies := make([]int64, 0, 100000) // 用于计算百分位延迟
+			var latencyMutex sync.Mutex
+
+			var wg sync.WaitGroup
+			stopCh := make(chan struct{}) // 停止信号通道
+
+			// 3. 启动并发工作负载
+			wg.Add(tc.numClients)
+			startTime := time.Now()
+
+			for i := 0; i < tc.numClients; i++ {
+				go func(id int) {
+					defer wg.Done()
+
+					// 创建KVRaft客户端
+					ck := cfg.makeClient(cfg.All())
+
+					for {
+						select {
+						case <-stopCh: // 检查是否应该停止
+							return
+						default:
+							// 生成工作负载
+							key := strconv.Itoa(rand.Intn(tc.keyRange))
+							val := randstring(tc.valueSize)
+
+							// 执行操作（读/写比例由测试用例定义）
+							opType := rand.Intn(100)
+							start := time.Now()
+
+							if opType < tc.readPercentage { // 读操作
+								Get(cfg, ck, key, nil, -1)
+								atomic.AddInt64(&getCount, 1)
+								opLatency := time.Since(start).Nanoseconds()
+								atomic.AddInt64(&readLatency, opLatency)
+							} else { // 写操作
+								Put(cfg, ck, key, val, nil, -1)
+								atomic.AddInt64(&putCount, 1)
+								opLatency := time.Since(start).Nanoseconds()
+								atomic.AddInt64(&writeLatency, opLatency)
+							}
+
+							// 记录操作延迟
+							opLatency := time.Since(start).Nanoseconds()
+							atomic.AddInt64(&totalLatency, opLatency)
+
+							// 添加到延迟数组（用于计算百分位）
+							latencyMutex.Lock()
+							latencies = append(latencies, opLatency)
+							latencyMutex.Unlock()
+
+							// 计数成功操作
+							atomic.AddInt64(&opsCount, 1)
+						}
+					}
+				}(i)
+			}
+
+			// 运行特定时间
+			time.Sleep(tc.duration)
+
+			// 4. 发送停止信号并等待完成
+			close(stopCh)
+			fmt.Println("正在停止客户端...")
+			wg.Wait()
+			fmt.Println("所有客户端已停止。")
+
+			elapsed := time.Since(startTime)
+			totalOps := atomic.LoadInt64(&opsCount)
+			gets := atomic.LoadInt64(&getCount)
+			puts := atomic.LoadInt64(&putCount)
+
+			// 5. 计算并报告结果
+			// 计算吞吐量
+			throughput := float64(totalOps) / elapsed.Seconds()
+
+			// 计算平均延迟
+			var avgLatency time.Duration
+			if totalOps > 0 {
+				avgLatency = time.Duration(atomic.LoadInt64(&totalLatency) / totalOps)
+			}
+
+			// 计算读写延迟
+			var avgReadLatency, avgWriteLatency time.Duration
+			if gets > 0 {
+				avgReadLatency = time.Duration(atomic.LoadInt64(&readLatency) / gets)
+			}
+			if puts > 0 {
+				avgWriteLatency = time.Duration(atomic.LoadInt64(&writeLatency) / puts)
+			}
+
+			// 计算百分位延迟
+			latencyMutex.Lock()
+			sort.Slice(latencies, func(i, j int) bool {
+				return latencies[i] < latencies[j]
+			})
+
+			var p50Latency, p99Latency time.Duration
+			if len(latencies) > 0 {
+				p50Index := len(latencies) * 50 / 100
+				p99Index := len(latencies) * 99 / 100
+				p50Latency = time.Duration(latencies[p50Index])
+				p99Latency = time.Duration(latencies[p99Index])
+			}
+			latencyMutex.Unlock()
+
+			// 保存结果用于比较
+			results[tc.name] = TestResult{
+				throughput:   throughput,
+				avgLatency:   avgLatency,
+				p50Latency:   p50Latency,
+				p99Latency:   p99Latency,
+				readLatency:  avgReadLatency,
+				writeLatency: avgWriteLatency,
+			}
+
+			// 6. 输出结果
+			fmt.Printf("--------------------\n")
+			fmt.Printf("测试结果: %s\n", tc.name)
+			fmt.Printf("  服务器数量: %d\n", tc.numServers)
+			fmt.Printf("  并发客户端数: %d\n", tc.numClients)
+			fmt.Printf("  读/写比例: %d/%d\n", tc.readPercentage, 100-tc.readPercentage)
+			fmt.Printf("  测试持续时间: %v\n", elapsed.Round(time.Second))
+			fmt.Printf("  总操作数: %d (读: %d, 写: %d)\n", totalOps, gets, puts)
+			fmt.Printf("  吞吐量: %.2f Ops/Sec\n", throughput)
+			fmt.Printf("  平均延迟: %v\n", avgLatency)
+			fmt.Printf("  P50延迟: %v\n", p50Latency)
+			fmt.Printf("  P99延迟: %v\n", p99Latency)
+			fmt.Printf("  读操作平均延迟: %v\n", avgReadLatency)
+			fmt.Printf("  写操作平均延迟: %v\n", avgWriteLatency)
+			fmt.Printf("--------------------\n")
+
+			// 将主要结果记录到测试日志中
+			t.Logf("%s - 吞吐量: %.2f Ops/Sec, 平均延迟: %v", tc.name, throughput, avgLatency)
+
+			fmt.Printf("  ... 通过\n")
+		})
+	}
+
+	// 输出汇总比较结果
+	fmt.Printf("\n\n========== KVRaft 性能测试汇总 ==========\n")
+	fmt.Printf("%-25s %-15s %-15s %-15s %-15s %-15s %-15s\n",
+		"测试名称", "吞吐量(ops/sec)", "平均延迟", "P50延迟", "P99延迟", "读延迟", "写延迟")
+
+	for _, tc := range testCases {
+		result := results[tc.name]
+		fmt.Printf("%-25s %-15.2f %-15v %-15v %-15v %-15v %-15v\n",
+			tc.name, result.throughput, result.avgLatency,
+			result.p50Latency, result.p99Latency,
+			result.readLatency, result.writeLatency)
+	}
+
+	// 计算节点数变化的比较
+	if result3, ok := results["3节点"]; ok {
+		if result5, ok := results["5节点"]; ok {
+			if result7, ok := results["7节点"]; ok {
+				fmt.Printf("\nKVRaft节点扩展性:\n")
+				fmt.Printf("  3节点吞吐量: %.2f ops/sec\n", result3.throughput)
+				fmt.Printf("  5节点吞吐量: %.2f ops/sec (比3节点变化: %.2f%%)\n",
+					result5.throughput,
+					(result5.throughput-result3.throughput)/result3.throughput*100)
+				fmt.Printf("  7节点吞吐量: %.2f ops/sec (比3节点变化: %.2f%%)\n",
+					result7.throughput,
+					(result7.throughput-result3.throughput)/result3.throughput*100)
+			}
+		}
+	}
+
+	// 网络可靠性比较
+	if reliableResult, ok := results["可靠网络"]; ok {
+		if unreliableResult, ok := results["不可靠网络"]; ok {
+			fmt.Printf("\n网络可靠性对比:\n")
+			fmt.Printf("  可靠网络吞吐量: %.2f ops/sec\n", reliableResult.throughput)
+			fmt.Printf("  不可靠网络吞吐量: %.2f ops/sec\n", unreliableResult.throughput)
+			fmt.Printf("  不可靠/可靠比: %.2f%%\n",
+				unreliableResult.throughput/reliableResult.throughput*100)
+		}
+	}
+
+	// 读写对比
+	if readResult, ok := results["读密集型"]; ok {
+		if writeResult, ok := results["写密集型"]; ok {
+			fmt.Printf("\n读写性能对比:\n")
+			fmt.Printf("  读密集型吞吐量: %.2f ops/sec\n", readResult.throughput)
+			fmt.Printf("  写密集型吞吐量: %.2f ops/sec\n", writeResult.throughput)
+			fmt.Printf("  读/写吞吐量比: %.2f\n", readResult.throughput/writeResult.throughput)
+		}
+	}
+
+	fmt.Printf("\n总结: 测试完成，共测试了 %d 个配置\n", len(testCases))
 }

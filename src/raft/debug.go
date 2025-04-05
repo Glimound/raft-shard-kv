@@ -35,7 +35,7 @@ const (
 	DebugShardKV     = false // shardkv系统使用的raft日志
 )
 
-const Debug = true
+const Debug = false
 
 var debugStart time.Time
 var dMu sync.Mutex
