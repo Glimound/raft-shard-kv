@@ -1082,7 +1082,7 @@ func TestShardKVPerformance(t *testing.T) {
 			// 给集群一些时间以完成配置和选举
 			time.Sleep(3 * time.Second)
 
-			// 2. 并发设置
+			// 并发设置
 			var opsCount int64           // 操作成功计数器
 			var getCount, putCount int64 // 分别计数读写操作
 
@@ -1094,7 +1094,7 @@ func TestShardKVPerformance(t *testing.T) {
 			var wg sync.WaitGroup
 			stopCh := make(chan struct{}) // 停止信号通道
 
-			// 3. 启动并发工作负载
+			// 启动并发工作负载
 			wg.Add(tc.numClients)
 			startTime := time.Now()
 
