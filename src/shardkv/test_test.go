@@ -1046,25 +1046,21 @@ func TestShardKVPerformance(t *testing.T) {
 
 	// 定义测试用例
 	testCases := []TestCase{
-		// ShardKV 测试
-		{"ShardKV-基础配置", "shardkv", 3, 3, 5, 20 * time.Second, 64, 80, 100},
-		{"ShardKV-读密集型", "shardkv", 3, 3, 5, 20 * time.Second, 64, 95, 100},
-		{"ShardKV-写密集型", "shardkv", 3, 3, 5, 20 * time.Second, 64, 50, 100},
-
-		// ShardKV 组数变化测试
+		{"ShardKV-basic", "shardkv", 3, 3, 5, 20 * time.Second, 64, 80, 100},
+		{"ShardKV-read-intensively", "shardkv", 3, 3, 5, 20 * time.Second, 64, 95, 100},
+		{"ShardKV-write-intensively", "shardkv", 3, 3, 5, 20 * time.Second, 64, 50, 100},
 		{"ShardKV-3nodes-1group", "shardkv", 1, 3, 5, 20 * time.Second, 64, 80, 100},
 		{"ShardKV-6nodes-2group", "shardkv", 2, 3, 5, 20 * time.Second, 64, 80, 100},
 		{"ShardKV-9nodes-3group", "shardkv", 3, 3, 5, 20 * time.Second, 64, 80, 100},
 	}
 
-	// 保存各个测试结果，用于最终比较
 	type TestResult struct {
-		throughput   float64       // 吞吐量 (ops/sec)
-		avgLatency   time.Duration // 平均延迟
-		p50Latency   time.Duration // 50分位延迟
-		p99Latency   time.Duration // 99分位延迟
-		readLatency  time.Duration // 读操作平均延迟
-		writeLatency time.Duration // 写操作平均延迟
+		throughput   float64
+		avgLatency   time.Duration
+		p50Latency   time.Duration
+		p99Latency   time.Duration
+		readLatency  time.Duration
+		writeLatency time.Duration
 	}
 
 	results := make(map[string]TestResult)
@@ -1073,7 +1069,6 @@ func TestShardKVPerformance(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fmt.Printf("========== 开始测试: %s ==========\n", tc.name)
 
-			// 1. 测试设置
 			var shardCfg *config
 			shardCfg = make_config(t, tc.serversPerNode, false, 10000) // 可靠网络
 			defer shardCfg.cleanup()
@@ -1120,27 +1115,24 @@ func TestShardKVPerformance(t *testing.T) {
 							key := strconv.Itoa(rand.Intn(tc.keyRange))
 							val := randstring(tc.valueSize)
 
-							// 执行操作（读/写比例由测试用例定义）
 							opType := rand.Intn(100)
 							start := time.Now()
 
-							if opType < tc.readPercentage { // 读操作
+							if opType < tc.readPercentage {
 								shardCk.Get(key)
 								atomic.AddInt64(&getCount, 1)
 								opLatency := time.Since(start).Nanoseconds()
 								atomic.AddInt64(&readLatency, opLatency)
-							} else { // 写操作
+							} else {
 								shardCk.Put(key, val)
 								atomic.AddInt64(&putCount, 1)
 								opLatency := time.Since(start).Nanoseconds()
 								atomic.AddInt64(&writeLatency, opLatency)
 							}
 
-							// 记录操作延迟
 							opLatency := time.Since(start).Nanoseconds()
 							atomic.AddInt64(&totalLatency, opLatency)
 
-							// 添加到延迟数组（用于计算百分位）
 							latencyMutex.Lock()
 							latencies = append(latencies, opLatency)
 							latencyMutex.Unlock()
@@ -1152,10 +1144,9 @@ func TestShardKVPerformance(t *testing.T) {
 				}(i)
 			}
 
-			// 运行特定时间
 			time.Sleep(tc.duration)
 
-			// 4. 发送停止信号并等待完成
+			// 发送停止信号并等待完成
 			close(stopCh)
 			fmt.Println("正在停止客户端...")
 			wg.Wait()
@@ -1166,7 +1157,6 @@ func TestShardKVPerformance(t *testing.T) {
 			gets := atomic.LoadInt64(&getCount)
 			puts := atomic.LoadInt64(&putCount)
 
-			// 5. 计算并报告结果
 			// 计算吞吐量
 			throughput := float64(totalOps) / elapsed.Seconds()
 
